@@ -1,3 +1,5 @@
+[toc]
+
 
 
 ![img](images/header.png)
@@ -120,17 +122,24 @@ The overall project consists of the following steps:
 
 # Overall Flow
 
-1. Migrate all the local data, scripts, and support JAR files from on-premise to S3
-2. Create the EMR Cluster as defined in the JOB_FLOW_OVERRIDES (JSON). We will be using several Airflow available operators such as `EmrCreateJobFlowOperator`, `EmrAddStepsOperator`,`EmrStepSensor`, `EmrTerminateJobFlowOperator`
-3. Once the cluster is up and running, we will migrate all the need files from S3 to the cluster to be processed inside the cluster. The JAR file will be copied to `/usr/lib/spark/jars/`, the data files will all be moved to `/source` folder.
-4. There are multiple Spark Steps defined. These steps take place inside the cluster. The final output of the ETL though will write the `parquet` to a local folder named `output` that is inside the cluster. The final step, will copy these file from the local cluster to S3 in a folder named `output` as well
-5. Once copying the files is completed, the cluster will be terminated.
+1. Migrate all the local data, scripts, and support JAR files from on-premise to S3 in the appropriate folders (image below)
+
+![img](images/image-20210305161330778.png)
+
+1. Create the EMR Cluster as defined in the JOB_FLOW_OVERRIDES (JSON). We will be using several Airflow available operators such as `EmrCreateJobFlowOperator`, `EmrAddStepsOperator`,`EmrStepSensor`, `EmrTerminateJobFlowOperator`
+2. Once the cluster is up and running, we will migrate all the need files from S3 to the cluster to be processed inside the cluster. The JAR file will be copied to `/usr/lib/spark/jars/`, the data files will all be moved to `/source` folder.
+3. There are multiple Spark Steps defined. These steps take place inside the cluster. The final output of the ETL though will write the `parquet` to a local folder named `output` that is inside the cluster. The final step, will copy these file from the local cluster to S3 in a folder named `output` as well
+4. Once copying the files is completed (image below of output folder in S3), the cluster will be terminated.
+
+![img](images/image-20210305161355588.png)
 
 The DAG below summarized these steps 
 
 
 
 ![img](images/image-20210305160811671.png)
+
+![img](images/image-20210305160826523.png)
 
 # Define the Cluster
 
@@ -183,6 +192,8 @@ JOB_FLOW_OVERRIDES = {
 ---
 
 # Spark Steps
+
+![img](images/image-20210305161014685.png)
 
 **When to use bootstrap actions vs steps in AWS EMR?**
 
@@ -292,7 +303,189 @@ There are two main functions in the code.
    1. Read the `sas7bdat` file and convert into a Spark data frame
    2. Select relevant columns 
    3. Partition (repartition) to improve performance 
-   4. Using SparML Bucketizer to transform the data frame and add new columns (buckets/bins)
+   4. Using SparkML Bucketizer to transform the data frame and add new columns (buckets/bins)
+2. **clustering_algorithm** 
+   1. Data preprocessing including OneHotEncoder, VectorAssembler, and a preprocessing pipeline
+   2. Perform KMeans Clustering (3 clusters)
+
+
+
+`process_data()`
+
+```python
+def process_data(spark, file_input, output):
+    """
+    Primary ETL function for data transformation
+
+    Arguments: 
+        spark: a spark session
+        file_input: data file path
+        output: file path to exported data after transformation
+    """
+
+    # in this example we will just load one  sas7bdat file given
+    df_spark =spark.read.format('com.github.saurfang.sas.spark').load(f'{file_input}/i94_apr16_sub.sas7bdat')
+   
+    df = df_spark.select("i94bir",
+                    "i94yr", 
+                    "i94mon", 
+                    "i94cit", 
+                    "i94res", 
+                    "i94port", 
+                    "arrdate", 
+                    "i94mode", 
+                    "i94addr", 
+                    "depdate", 
+                    "i94visa", 
+                    "visapost", 
+                    "gender", 
+                    "airline", 
+                    "fltno", 
+                    "visatype").dropna(subset=["i94bir"]).repartition(10000)
+
+    ## Create bins/buckets for AgeGroup
+    splits = [-float("inf"),12,18,25,35,45,56, 65, 75, float("inf")]
+    bucketizer = Bucketizer(splits=splits, inputCol="i94bir", outputCol="AgeGroup")
+    df_bucket_1 = bucketizer.setHandleInvalid("keep").transform(df)
+
+    ## Add labels to AgeGroup
+    t = {0.0:"Under 12", 1.0: "12-17", 2.0:"18-24", 3.0: "25-34", 4.0: "35-44", 5.0: "45-55", 6.0: "56-64", 7.0: "65-74", 8.0: "75+"}
+    udf_foo = udf(lambda x: t[x], StringType())
+    df_bucket_1_lbl = df_bucket_1.withColumn("AgeGroupName", udf_foo("AgeGroup"))
+
+    ## Create bins/bucket for AgeCategory
+    splits = [-float("inf"), 19, 23, 65, float("inf")]
+    bucketizer = Bucketizer(splits=splits, inputCol="i94bir", outputCol="AgeCat")
+    df_bucket_2 = bucketizer.setHandleInvalid("keep").transform(df_bucket_1_lbl)
+
+    ## Create labels to AgeCategory
+    t = {0.0:"School", 1.0: "College", 2.0:"Professional", 3.0: "Senior"}
+    udf_foo = udf(lambda x: t[x], StringType())
+    df_bucket_2_lbl = df_bucket_2.withColumn("AgeCatName", udf_foo("AgeCat"))
+
+    date_add_udf = f.udf(date_add_, DateType())
+
+    ## apply to convert arrdate and deprate 
+    df_bucket_arv = df_bucket_2_lbl.withColumn('actual_arrival_date', date_add_udf('arrdate'))
+    df_bucket_dep = df_bucket_arv.withColumn('actual_departure_date', date_add_udf('depdate'))
+
+    # final df_bucket selection
+    df_final = df_bucket_dep.select('i94cit', 
+                            'i94res', 
+                            'i94port', 
+                            'i94mode', 
+                            'i94bir', 
+                            'i94visa', 
+                            'i94addr', 
+                            'gender', 
+                            'airline', 
+                            'fltno', 
+                            'visatype', 
+                            'AgeGroupName', 
+                            'AgeCatName', 
+                            'actual_arrival_date', 
+                            'actual_departure_date')
+
+    # Convert datasets from python dictionary to PySpark DF
+    states_df = spark.sparkContext.parallelize([{"code":k, "name":v} for k,v in states.items()]).toDF()
+    i94cntyl_df = spark.sparkContext.parallelize([{"code":k, "name":v} for k,v in i94cntyl.items()]).toDF()
+    i94model_df = spark.sparkContext.parallelize([{"code":k, "name":v} for k,v in i94model.items()]).toDF()
+    i94prtl_df = spark.sparkContext.parallelize([{"code":k, "name":v} for k,v in i94prtl.items()]).toDF()
+    i94visa_df = spark.sparkContext.parallelize([{"code":k, "name":v} for k,v in i94visa.items()]).toDF()
+
+    # GlobalLandTemperatureByCity Data
+    fname = f'{file_input}/GlobalLandTemperaturesByCity.csv'
+    temp = spark.read.csv(fname, header='true')
+
+    # Aggregate and filter the data
+    temp_df = temp.filter(((temp.Country == 'United States' ))& (f.year(f.to_timestamp(temp.dt, 'yyyy-MM-dd')) >= 2003)) \
+        .select('AverageTemperature', 
+                'City', 
+                'Latitude', 
+                'Longitude', 
+                f.month(f.to_timestamp(temp.dt, 'yyyy-MM-dd')).alias('month'))\
+        .groupBy('month', 'City').agg(f.avg('AverageTemperature').alias('AvgTemp'), f.max('Latitude').alias('Latitude'), f.max('Longitude').alias('Longitude'))
+
+    # time table
+    time_table = df_final.select(
+                    f.col('actual_arrival_date').alias('date'),
+                    f.year('actual_arrival_date').alias('year'),
+                    f.month('actual_arrival_date').alias('month'),
+                    f.dayofmonth('actual_arrival_date').alias('dayofmonth'),
+                    f.weekofyear('actual_arrival_date').alias('weekofyear')
+                        )
+
+    # Write out the data sets
+    df_final.repartition("airline", "i94mode").write.partitionBy("airline", "i94mode").mode("overwrite").parquet(f"{output}/i94_immigration_fact.parquet", mode="overwrite")
+    
+    states_df.write.parquet(f"{output}/i94_states_dim.parquet", mode="overwrite")
+    i94cntyl_df.write.parquet(f"{output}/i94_cntyl_dim.parquet", mode="overwrite")
+    i94model_df.write.parquet(f"{output}/i94_mode_dim.parquet", mode="overwrite")
+    i94prtl_df.write.parquet(f"{output}/i94_port_dim.parquet", mode="overwrite")
+    i94visa_df.write.parquet(f"{output}/i94_visa_dim.parquet", mode="overwrite")
+    temp_df.write.parquet(f"{output}/i94_temperature_dim.parquet", mode="overwrite")
+```
+
+
+
+`clustering_algorithm`
+
+```python
+def clustering_algorithm(spark, input_data):
+    """
+    Function to perform KMeans clustering. This function take the Spark session, and input dataframe, 
+    then performs OneHotEncoding and additional preprocessing steps to finally add a `cluster` columns.
+    """
+    print("==Clustering Algorithm Started==")
+    # Cluster Data Set
+    from pyspark.ml.feature import VectorAssembler, OneHotEncoderEstimator, OneHotEncoder, OneHotEncoderModel, StringIndexer
+    from pyspark.ml import Pipeline
+    from pyspark.ml.clustering import KMeans
+
+
+    cols = ["i94addr", "visatype", "i94port", "gender", "airline", "AgeGroupName", "AgeCatName"]
+    othercols = ['i94cit', 'i94res', 'i94mode', 'i94bir', 'i94visa']
+
+    indexers = [
+        StringIndexer(inputCol=c, outputCol="{0}_indexed".format(c))
+        for c in cols
+    ]
+
+    encoders = [ OneHotEncoder(inputCol=indexer.getOutputCol(),
+                    outputCol="{0}_encoded".format(indexer.getOutputCol()))
+                    for indexer in indexers ]
+
+    assembler = VectorAssembler(inputCols=[encoder.getOutputCol() for encoder in encoders]
+                                    +othercols , outputCol="features")
+
+    ff = input_data.select("i94addr", 
+                        "visatype", 
+                        "i94port", 
+                        "gender", 
+                        "airline", 
+                        "AgeGroupName", 
+                        "AgeCatName",
+                        "i94cit", 
+                        "i94res", 
+                        "i94mode", 
+                        "i94bir", 
+                        "i94visa").dropna().dropDuplicates().repartition(1000)
+
+    preprocess = Pipeline(stages=indexers + encoders + [assembler]).fit(ff)
+
+    data = preprocess.transform(ff)
+
+    kmeans = KMeans(k=3, seed=1)  # 3 clusters 
+    model = kmeans.fit(data.select('features'))
+    transformed = model.transform(data)
+    cluster_df = transformed.select("i94addr", "visatype", "i94port", "gender", "airline",
+        'i94cit', 'i94res', 'i94mode', 'i94bir', 'i94visa', 'AgeGroupName', 'AgeCatName', f.col("prediction").alias("cluster")
+    )
+
+    cluster_df.repartition("cluster").write.partitionBy("cluster").mode("overwrite").parquet("i94_data/i94_immigration_cluster.parquet")
+```
+
+
 
 ----
 
@@ -422,6 +615,79 @@ To stop and delete containers, delete volumes with database data and download im
 docker-compose down --volumes --rmi all
 ```
 
-## Notes
+---
 
-By default, the Docker Compose file uses the latest Airflow image ([apache/airflow](https://hub.docker.com/r/apache/airflow)). If you need, you can [customize and extend it](https://airflow.apache.org/docs/apache-airflow/stable/production-deployment.html#docker-image).
+# Lessons Learned 
+
+* When doing a lot of transformations, such as `.dropna()` or `.dropDuplicates()` as an example, it is a good idea to check the number of partitions as things may change and can cause issues later on. This can be done using `getNumPartitions()`
+
+```python
+df_final.rdd.getNumPartitions()
+```
+
+And adjusting the partition can be done simply using `repartition`
+
+```python
+df_final.repartition(1000)
+```
+
+* Repartition creates same size partitions and can speed up overall execution and process.
+* `repartition` partition data in memory while `partitionBy` creates on Disk before write.
+* You can combined `repartition` and `partitionBy` like in this example 
+
+```python
+df_final.repartition("airline", "i94mode").write.partitionBy("airline", "i94mode").mode("overwrite").parquet(f"{output}/i94_immigration_fact.parquet", mode="overwrite")
+```
+
+---
+
+## Discussion
+
+> - The data was increased by 100x.
+> - The pipelines would be run on a daily basis by 7 am every day.
+> - The database needed to be accessed by 100+ people.
+
+**The data was increased by 100x**
+
+Leveraging AWS EMR is a scalable option. To handle larger data, increasing the size of the cluster, and number of nodes would allow Spark to handle larger amount of data. 
+
+Also, batch processing would speed up the overall process of migrating the data. We can partition the data in Spark to improve performance. 
+
+**The pipelines would be run on a daily basis by 7 am every day.**
+
+Airflow makes it easy to setup a schedule, form daily, weekly, monthly ..etc.
+
+```python
+dag = DAG("emr_dag",
+          default_args=default_args,
+          description="Load and transform with Airflow and AWS EMR-Spark",
+          schedule_interval="@daily"
+          )
+```
+
+If we want this to occur daily at 7 am then we can use **cron** style like this `0 7 * * *`
+
+```python
+dag = DAG("emr_dag",
+          default_args=default_args,
+          description="Load and transform with Airflow and AWS EMR-Spark",
+          schedule_interval="0 7 * * *"
+          )
+```
+
+**The database needed to be accessed by 100+ people.**
+
+Right now the data is in S3, which can scale and handle man concurrent users without issues. AWS makes it easy to scale this way through replication and portioning behind the scene. Similarly, if the data was stored in AWS RDS, or Redshift, can handle simultaneous client connections and requests.
+
+For example [RDS ](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_Limits.html)
+
+| DB engine         | Parameter                                | Allowed values | Default value                                 | Description                                       |
+| :---------------- | :--------------------------------------- | :------------- | :-------------------------------------------- | :------------------------------------------------ |
+| MariaDB and MySQL | `max_connections`                        | 1–100000       | {DBInstanceClassMemory/12582880}              | Number of simultaneous client connections allowed |
+| Oracle            | `processes`                              | 80–20000       | LEAST({DBInstanceClassMemory/9868951}, 20000) | User processes                                    |
+| `sessions`        | 100–65535                                | –              | User and system sessions                      |                                                   |
+| PostgreSQL        | `max_connections`                        | 6–8388607      | LEAST({DBInstanceClassMemory/9531392}, 5000)  | Maximum number of concurrent connections          |
+| SQL Server        | Maximum number of concurrent connections | 0–32767        | 0 (unlimited)                                 | Maximum number of concurrent connections          |
+
+Similarly, AWS Redshift has a set of limits and quota which can be accessed [here](https://docs.aws.amazon.com/redshift/latest/mgmt/amazon-redshift-limits.html). For an increase on those limits, there is a request form https://console.aws.amazon.com/support/home?#/case/create?issueType=service-limit-increase&limitType=service-code-redshift
+
